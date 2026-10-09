@@ -52,6 +52,9 @@ var (
 		"If set to 2h, then the indexdb rotation is performed at 4am EET time (the timezone with +2h offset)")
 	minScrapeInterval = flag.Duration("dedup.minScrapeInterval", 0, "Leave only the last sample in every time series per each discrete interval "+
 		"equal to -dedup.minScrapeInterval > 0. See also -streamAggr.dedupInterval and https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#deduplication")
+	downsampling = flag.String("downsampling.period", "", "Comma-separated age:interval rules for historical data. "+
+		"Example: -downsampling.period=30d:1m,180d:5m leaves one sample per 1 minute for samples older than 30 days, "+
+		"and one sample per 5 minutes for samples older than 180 days. The base interval remains -dedup.minScrapeInterval.")
 	inmemoryDataFlushInterval = flag.Duration("inmemoryDataFlushInterval", 5*time.Second, "The interval for guaranteed saving of in-memory data to disk. "+
 		"The saved data survives unclean shutdowns such as OOM crash, hardware reset, SIGKILL, etc. "+
 		"Bigger intervals may help increase the lifetime of flash storage with limited write cycles (e.g. Raspberry PI). "+
@@ -118,6 +121,7 @@ func DataPath() string {
 // Init initializes vmstorage.
 func Init(vmselectMaxConcurrentRequests int, vmselectMaxQueueDuration time.Duration, resetCacheIfNeeded func(mrs []storage.MetricRow)) {
 	storage.SetDedupInterval(*minScrapeInterval)
+	storage.SetDownsampling(*downsampling)
 	storage.SetDataFlushInterval(*inmemoryDataFlushInterval)
 	storage.LegacySetRetentionTimezoneOffset(*retentionTimezoneOffset)
 	storage.SetFreeDiskSpaceLimit(minFreeDiskSpaceBytes.N)

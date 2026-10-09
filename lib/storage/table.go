@@ -491,7 +491,7 @@ func (tb *table) startHistoricalMergeWatcher() {
 }
 
 func (tb *table) historicalMergeWatcher() {
-	if !isDedupEnabled() {
+	if !isDedupEnabled() && len(GetDownSamplingMeta()) == 0 {
 		// Deduplication and retentionFilters are disabled.
 		return
 	}

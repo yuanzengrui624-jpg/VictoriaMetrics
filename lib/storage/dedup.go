@@ -1,6 +1,10 @@
 package storage
 
 import (
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
@@ -21,6 +25,84 @@ func GetDedupInterval() int64 {
 }
 
 var globalDedupInterval int64
+
+var downsamplingMeta []DownSamplingMeta
+
+// GetDownSamplingMeta returns downsampling rules set via SetDownsampling.
+// The slice is ordered from the largest age to the smallest.
+func GetDownSamplingMeta() []DownSamplingMeta {
+	return downsamplingMeta
+}
+
+// SetDownsampling parses rules like -downsampling.period=30d:1m,180d:5m.
+// Invalid rules are skipped. This must be called before initializing the storage.
+func SetDownsampling(downsampling string) {
+	downsamplingMeta = nil
+	if downsampling == "" {
+		return
+	}
+	for _, rule := range strings.Split(downsampling, ",") {
+		chunks := strings.Split(rule, ":")
+		if len(chunks) != 2 {
+			continue
+		}
+		duration, err1 := convertDuration(chunks[0])
+		interval, err2 := convertDuration(chunks[1])
+		if err1 != nil || err2 != nil || interval <= time.Millisecond {
+			continue
+		}
+		downsamplingMeta = append(downsamplingMeta, DownSamplingMeta{
+			Duration:             duration,
+			DownsamplingInterval: interval,
+		})
+	}
+	if len(downsamplingMeta) > 1 {
+		sort.Slice(downsamplingMeta, func(i, j int) bool {
+			return downsamplingMeta[i].Duration > downsamplingMeta[j].Duration
+		})
+	}
+}
+
+func convertDuration(duration string) (time.Duration, error) {
+	var hours int
+	switch {
+	case strings.HasSuffix(duration, "y"):
+		value, err := strconv.Atoi(strings.TrimSuffix(duration, "y"))
+		if err != nil {
+			return 0, fmt.Errorf("invalid time range: %q", duration)
+		}
+		hours = value * 365 * 24
+		return time.ParseDuration(fmt.Sprintf("%dh", hours))
+	case strings.HasSuffix(duration, "w"):
+		value, err := strconv.Atoi(strings.TrimSuffix(duration, "w"))
+		if err != nil {
+			return 0, fmt.Errorf("invalid time range: %q", duration)
+		}
+		hours = value * 7 * 24
+		return time.ParseDuration(fmt.Sprintf("%dh", hours))
+	case strings.HasSuffix(duration, "d"):
+		value, err := strconv.Atoi(strings.TrimSuffix(duration, "d"))
+		if err != nil {
+			return 0, fmt.Errorf("invalid time range: %q", duration)
+		}
+		hours = value * 24
+		return time.ParseDuration(fmt.Sprintf("%dh", hours))
+	case strings.HasSuffix(duration, "h"), strings.HasSuffix(duration, "m"), strings.HasSuffix(duration, "s"), strings.HasSuffix(duration, "ms"):
+		parsed, err := time.ParseDuration(duration)
+		if err != nil {
+			return 0, fmt.Errorf("invalid time range: %q", duration)
+		}
+		return parsed, nil
+	default:
+		return 0, fmt.Errorf("invalid time duration string: %q", duration)
+	}
+}
+
+// DownSamplingMeta is one age threshold and the dedup interval applied after that age.
+type DownSamplingMeta struct {
+	Duration             time.Duration
+	DownsamplingInterval time.Duration
+}
 
 func isDedupEnabled() bool {
 	return globalDedupInterval > 0

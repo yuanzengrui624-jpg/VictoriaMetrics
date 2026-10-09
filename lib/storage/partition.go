@@ -1200,9 +1200,35 @@ func (pt *partition) isFinalDedupNeeded() bool {
 
 	pws := pt.GetParts(nil, false)
 	minDedupInterval := getMinDedupInterval(pws)
+	need := dedupInterval > minDedupInterval || downsamplingNeeded(pws)
 	pt.PutParts(pws)
 
-	return dedupInterval > minDedupInterval
+	return need
+}
+
+// downsamplingNeeded reports whether any part is old enough for a coarser
+// interval than the one already recorded on its header.
+func downsamplingNeeded(pws []*partWrapper) bool {
+	samplingMeta := GetDownSamplingMeta()
+	if len(samplingMeta) == 0 {
+		return false
+	}
+	nowTime := time.Now().UnixMilli()
+	for _, pw := range pws {
+		if pw == nil {
+			continue
+		}
+		ph := pw.p.ph
+		for _, v := range samplingMeta {
+			if nowTime-ph.MaxTimestamp <= v.Duration.Milliseconds() {
+				continue
+			}
+			if v.DownsamplingInterval.Milliseconds() > ph.MinDedupInterval {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func getMinDedupInterval(pws []*partWrapper) int64 {
@@ -1432,7 +1458,12 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
 		return nil, fmt.Errorf("cannot merge %d parts to %s: %w", len(bsrs), dstPartPath, err)
 	}
 	if dstPartPath != "" {
-		ph.MinDedupInterval = GetDedupInterval()
+		// Keep a coarser interval already written from the blocks in this merge.
+		// Overwriting it with -dedup.minScrapeInterval would make the hourly
+		// check treat the part as not yet downsampled.
+		if ph.MinDedupInterval <= 0 {
+			ph.MinDedupInterval = GetDedupInterval()
+		}
 		ph.MustWriteMetadata(dstPartPath)
 	}
 	return &ph, nil

@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/atomicutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
@@ -149,10 +150,11 @@ func (b *Block) tooBig() bool {
 	return false
 }
 
-func (b *Block) deduplicateSamplesDuringMerge() {
-	if !isDedupEnabled() {
+func (b *Block) deduplicateSamplesDuringMerge() int64 {
+	samplingMeta := GetDownSamplingMeta()
+	if !isDedupEnabled() && len(samplingMeta) == 0 {
 		// Deduplication is disabled
-		return
+		return 0
 	}
 	// Unmarshal block if it isn't unmarshaled yet in order to apply the de-duplication to unmarshaled samples.
 	if err := b.UnmarshalData(); err != nil {
@@ -161,12 +163,22 @@ func (b *Block) deduplicateSamplesDuringMerge() {
 	srcTimestamps := b.timestamps[b.nextIdx:]
 	if len(srcTimestamps) < 2 {
 		// Nothing to dedup.
-		return
+		return 0
 	}
 	dedupInterval := GetDedupInterval()
+	// Use the newest sample in this block. Rules are sorted from the oldest age to the newest,
+	// so the first matching rule is the coarsest interval that applies.
+	nowTime := time.Now().UnixMilli()
+	newest := srcTimestamps[len(srcTimestamps)-1]
+	for _, v := range samplingMeta {
+		if nowTime-newest > v.Duration.Milliseconds() {
+			dedupInterval = v.DownsamplingInterval.Milliseconds()
+			break
+		}
+	}
 	if dedupInterval <= 0 {
 		// Deduplication is disabled.
-		return
+		return 0
 	}
 	srcValues := b.values[b.nextIdx:]
 	timestamps, values := deduplicateSamplesDuringMerge(srcTimestamps, srcValues, dedupInterval)
@@ -174,6 +186,7 @@ func (b *Block) deduplicateSamplesDuringMerge() {
 	dedupsDuringMerge.Add(uint64(dedups))
 	b.timestamps = b.timestamps[:b.nextIdx+len(timestamps)]
 	b.values = b.values[:b.nextIdx+len(values)]
+	return dedupInterval
 }
 
 var dedupsDuringMerge atomicutil.Uint64
