@@ -11,13 +11,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/syncwg"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/timeutil"
 )
 
@@ -39,6 +39,14 @@ const maxInmemoryParts = 60
 // See appendPartsToMerge tests for details.
 const defaultPartsToMerge = 15
 
+// The number of shards for rawRow entries per partition.
+//
+// Higher number of shards reduces CPU contention and increases the max bandwidth on multi-core systems.
+var rawRowsShardsPerPartition = cgroup.AvailableCPUs()
+
+// The interval for flushing buffered rows into parts, so they become visible to search.
+const pendingRowsFlushInterval = 2 * time.Second
+
 // The interval for guaranteed flush of recently ingested data from memory to on-disk parts, so they survive process crash.
 var dataFlushInterval = 5 * time.Second
 
@@ -56,6 +64,11 @@ func SetDataFlushInterval(d time.Duration) {
 
 	dataFlushInterval = d
 }
+
+// The maximum number of rawRow items in rawRowsShard.
+//
+// Limit the maximum shard size to 8Mb, since this gives the lowest CPU usage under high ingestion rate.
+const maxRawRowsPerShard = (8 << 20) / int(unsafe.Sizeof(rawRow{}))
 
 // partition represents a partition.
 type partition struct {
@@ -85,11 +98,7 @@ type partition struct {
 	// the path to directory with bigParts.
 	bigPartsPath string
 
-	// the path to directory with IndexDB parts.
-	indexDBPartsPath string
-
 	// The parent storage.
-	// TODO(@rtm0): Do not depend on Storage, pass only what is required.
 	s *Storage
 
 	// Name is the name of the partition in the form YYYY_MM.
@@ -117,9 +126,6 @@ type partition struct {
 	// Contains file-based parts with big number of items, which are visible for search.
 	bigParts []*partWrapper
 
-	// Contains the inverted index for the data stored in this partition.
-	idb *indexDB
-
 	// stopCh is used for notifying all the background workers to stop.
 	//
 	// It must be closed under partsLock in order to prevent from calling wg.Add()
@@ -131,9 +137,6 @@ type partition struct {
 	// wg.Add() must be called under partsLock after checking whether stopCh isn't closed.
 	// This should prevent from calling wg.Add() after stopCh is closed and wg.Wait() is called.
 	wg sync.WaitGroup
-
-	// Use syncwg instead of sync, since Add/Wait may be called from concurrent goroutines.
-	flushPendingItemsWG syncwg.WaitGroup
 }
 
 // partWrapper is a wrapper for the part.
@@ -184,37 +187,23 @@ func (pw *partWrapper) decRef() {
 	pw.p = nil
 
 	if deletePath != "" {
-		fs.MustRemoveDir(deletePath)
+		fs.MustRemoveAll(deletePath)
 	}
 }
 
-// mustCreatePartition creates new partition for the given timestamp and the given paths to small and big partitions.
-func mustCreatePartition(timestamp int64, smallPartitionsPath, bigPartitionsPath, indexDBPath string, s *Storage) *partition {
-	var tr TimeRange
-	tr.fromPartitionTimestamp(timestamp)
+// mustCreatePartition creates new partition for the given timestamp and the given paths
+// to small and big partitions.
+func mustCreatePartition(timestamp int64, smallPartitionsPath, bigPartitionsPath string, s *Storage) *partition {
 	name := timestampToPartitionName(timestamp)
-
 	smallPartsPath := filepath.Join(filepath.Clean(smallPartitionsPath), name)
 	bigPartsPath := filepath.Join(filepath.Clean(bigPartitionsPath), name)
-	indexDBPartsPath := filepath.Join(filepath.Clean(indexDBPath), name)
-	logger.Infof("creating a partition %q with smallPartsPath=%q, bigPartsPath=%q, indexDBPartsPath=%q", name, smallPartsPath, bigPartsPath, indexDBPartsPath)
+	logger.Infof("creating a partition %q with smallPartsPath=%q, bigPartsPath=%q", name, smallPartsPath, bigPartsPath)
 
 	fs.MustMkdirFailIfExist(smallPartsPath)
 	fs.MustMkdirFailIfExist(bigPartsPath)
-	fs.MustMkdirFailIfExist(indexDBPartsPath)
 
-	// Create parts.json file. Since we are creating a new partition, there
-	// will be no parts, i.e. the smallPartsPath and bigPartPath dirs will be
-	// empty. This is guaranteed by the code above: if either directory exists,
-	// there will be panic.
-	mustWritePartNames(nil, nil, smallPartsPath)
-
-	pt := newPartition(name, smallPartsPath, bigPartsPath, indexDBPartsPath, tr, s)
-
-	fs.MustSyncPathAndParentDir(smallPartsPath)
-	fs.MustSyncPathAndParentDir(bigPartsPath)
-	fs.MustSyncPathAndParentDir(indexDBPartsPath)
-
+	pt := newPartition(name, smallPartsPath, bigPartsPath, s)
+	pt.tr.fromPartitionTimestamp(timestamp)
 	pt.startBackgroundWorkers()
 
 	logger.Infof("partition %q has been created", name)
@@ -237,35 +226,21 @@ func (pt *partition) startBackgroundWorkers() {
 //
 // The pt must be detached from table before calling pt.Drop.
 func (pt *partition) Drop() {
-	logger.Infof("dropping partition %q at smallPartsPath=%q, bigPartsPath=%q, indexDBPartsPath=%q", pt.name, pt.smallPartsPath, pt.bigPartsPath, pt.indexDBPartsPath)
+	logger.Infof("dropping partition %q at smallPartsPath=%q, bigPartsPath=%q", pt.name, pt.smallPartsPath, pt.bigPartsPath)
 
-	fs.MustRemoveDir(pt.smallPartsPath)
-	fs.MustRemoveDir(pt.bigPartsPath)
-	fs.MustRemoveDir(pt.indexDBPartsPath)
+	fs.MustRemoveDirAtomic(pt.smallPartsPath)
+	fs.MustRemoveDirAtomic(pt.bigPartsPath)
 	logger.Infof("partition %q has been dropped", pt.name)
 }
 
 // mustOpenPartition opens the existing partition from the given paths.
-func mustOpenPartition(smallPartsPath, bigPartsPath, indexDBPartsPath string, s *Storage) *partition {
+func mustOpenPartition(smallPartsPath, bigPartsPath string, s *Storage) *partition {
 	smallPartsPath = filepath.Clean(smallPartsPath)
 	bigPartsPath = filepath.Clean(bigPartsPath)
-	indexDBPartsPath = filepath.Clean(indexDBPartsPath)
-
-	// Create paths to parts if they are missing.
-	fs.MustMkdirIfNotExist(smallPartsPath)
-	fs.MustMkdirIfNotExist(bigPartsPath)
-	fs.MustMkdirIfNotExist(indexDBPartsPath)
 
 	name := filepath.Base(smallPartsPath)
-	var tr TimeRange
-	if err := tr.fromPartitionName(name); err != nil {
-		logger.Panicf("FATAL: cannot obtain partition time range from smallPartsPath %q: %s", smallPartsPath, err)
-	}
 	if !strings.HasSuffix(bigPartsPath, name) {
 		logger.Panicf("FATAL: partition name in bigPartsPath %q doesn't match smallPartsPath %q; want %q", bigPartsPath, smallPartsPath, name)
-	}
-	if !strings.HasSuffix(indexDBPartsPath, name) {
-		logger.Panicf("FATAL: partition name in indexDBPartsPath %q doesn't match smallPartsPath %q; want %q", indexDBPartsPath, smallPartsPath, name)
 	}
 
 	partsFile := filepath.Join(smallPartsPath, partsFilename)
@@ -276,40 +251,32 @@ func mustOpenPartition(smallPartsPath, bigPartsPath, indexDBPartsPath string, s 
 
 	if !fs.IsPathExist(partsFile) {
 		// Create parts.json file if it doesn't exist yet.
-		// This should protect from possible crashloops just after the migration from versions below v1.90.0
+		// This should protect from possible carshloops just after the migration from versions below v1.90.0
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/4336
 		mustWritePartNames(smallParts, bigParts, smallPartsPath)
 	}
 
-	pt := newPartition(name, smallPartsPath, bigPartsPath, indexDBPartsPath, tr, s)
+	pt := newPartition(name, smallPartsPath, bigPartsPath, s)
 	pt.smallParts = smallParts
 	pt.bigParts = bigParts
-
-	fs.MustSyncPathAndParentDir(smallPartsPath)
-	fs.MustSyncPathAndParentDir(bigPartsPath)
-
+	if err := pt.tr.fromPartitionName(name); err != nil {
+		logger.Panicf("FATAL: cannot obtain partition time range from smallPartsPath %q: %s", smallPartsPath, err)
+	}
 	pt.startBackgroundWorkers()
 
 	return pt
 }
 
-func newPartition(name, smallPartsPath, bigPartsPath, indexDBPartsPath string, tr TimeRange, s *Storage) *partition {
-	id := uint64(tr.MinTimestamp)
-	idb := mustOpenIndexDB(id, tr, name, indexDBPartsPath, s, &s.isReadOnly, false)
-
+func newPartition(name, smallPartsPath, bigPartsPath string, s *Storage) *partition {
 	p := &partition{
-		name:             name,
-		smallPartsPath:   smallPartsPath,
-		bigPartsPath:     bigPartsPath,
-		indexDBPartsPath: indexDBPartsPath,
-		tr:               tr,
-		s:                s,
-		idb:              idb,
-		stopCh:           make(chan struct{}),
+		name:           name,
+		smallPartsPath: smallPartsPath,
+		bigPartsPath:   bigPartsPath,
+		s:              s,
+		stopCh:         make(chan struct{}),
 	}
 	p.mergeIdx.Store(uint64(time.Now().UnixNano()))
 	p.rawRows.init()
-
 	return p
 }
 
@@ -323,10 +290,9 @@ type partitionMetrics struct {
 	IndexBlocksCacheRequests     uint64
 	IndexBlocksCacheMisses       uint64
 
-	InmemorySizeBytes  uint64
-	SmallSizeBytes     uint64
-	BigSizeBytes       uint64
-	MetaindexSizeBytes uint64
+	InmemorySizeBytes uint64
+	SmallSizeBytes    uint64
+	BigSizeBytes      uint64
 
 	InmemoryRowsCount uint64
 	SmallRowsCount    uint64
@@ -362,8 +328,6 @@ type partitionMetrics struct {
 
 	ScheduledDownsamplingPartitions     uint64
 	ScheduledDownsamplingPartitionsSize uint64
-
-	IndexDBMetrics IndexDBMetrics
 }
 
 // TotalRowsCount returns total number of rows in tm.
@@ -387,7 +351,6 @@ func (pt *partition) UpdateMetrics(m *partitionMetrics) {
 		m.InmemoryRowsCount += p.ph.RowsCount
 		m.InmemoryBlocksCount += p.ph.BlocksCount
 		m.InmemorySizeBytes += p.size
-		m.MetaindexSizeBytes += p.metaindexSizeBytes
 		m.InmemoryPartsRefCount += uint64(pw.refCount.Load())
 		if isDedupScheduled {
 			m.ScheduledDownsamplingPartitionsSize += p.size
@@ -398,7 +361,6 @@ func (pt *partition) UpdateMetrics(m *partitionMetrics) {
 		m.SmallRowsCount += p.ph.RowsCount
 		m.SmallBlocksCount += p.ph.BlocksCount
 		m.SmallSizeBytes += p.size
-		m.MetaindexSizeBytes += p.metaindexSizeBytes
 		m.SmallPartsRefCount += uint64(pw.refCount.Load())
 		if isDedupScheduled {
 			m.ScheduledDownsamplingPartitionsSize += p.size
@@ -409,7 +371,6 @@ func (pt *partition) UpdateMetrics(m *partitionMetrics) {
 		m.BigRowsCount += p.ph.RowsCount
 		m.BigBlocksCount += p.ph.BlocksCount
 		m.BigSizeBytes += p.size
-		m.MetaindexSizeBytes += p.metaindexSizeBytes
 		m.BigPartsRefCount += uint64(pw.refCount.Load())
 		if isDedupScheduled {
 			m.ScheduledDownsamplingPartitionsSize += p.size
@@ -443,8 +404,6 @@ func (pt *partition) UpdateMetrics(m *partitionMetrics) {
 	m.InmemoryRowsDeleted += pt.inmemoryRowsDeleted.Load()
 	m.SmallRowsDeleted += pt.smallRowsDeleted.Load()
 	m.BigRowsDeleted += pt.bigRowsDeleted.Load()
-
-	pt.idb.UpdateMetrics(&m.IndexDBMetrics)
 }
 
 // AddRows adds the given rows to the partition pt.
@@ -469,31 +428,156 @@ func (pt *partition) AddRows(rows []rawRow) {
 		}
 	}
 
-	pt.rawRows.addRows(pt.flushRowssToInmemoryParts, rows)
+	pt.rawRows.addRows(pt, rows)
 }
 
 var isDebug = false
 
-func (pt *partition) flushRowssToInmemoryParts(rowss [][]rawRow) {
-	var nonEmptyRowss [][]rawRow
-	for _, rows := range rowss {
-		if len(rows) > 0 {
-			nonEmptyRowss = append(nonEmptyRowss, rows)
-		}
+type rawRowsShards struct {
+	flushDeadlineMs atomic.Int64
+
+	shardIdx atomic.Uint32
+
+	// Shards reduce lock contention when adding rows on multi-CPU systems.
+	shards []rawRowsShard
+
+	rowssToFlushLock sync.Mutex
+	rowssToFlush     [][]rawRow
+}
+
+func (rrss *rawRowsShards) init() {
+	rrss.shards = make([]rawRowsShard, rawRowsShardsPerPartition)
+}
+
+func (rrss *rawRowsShards) addRows(pt *partition, rows []rawRow) {
+	shards := rrss.shards
+	shardsLen := uint32(len(shards))
+	for len(rows) > 0 {
+		n := rrss.shardIdx.Add(1)
+		idx := n % shardsLen
+		tailRows, rowsToFlush := shards[idx].addRows(rows)
+		rrss.addRowsToFlush(pt, rowsToFlush)
+		rows = tailRows
 	}
-	if len(nonEmptyRowss) == 0 {
+}
+
+func (rrss *rawRowsShards) addRowsToFlush(pt *partition, rowsToFlush []rawRow) {
+	if len(rowsToFlush) == 0 {
+		return
+	}
+
+	var rowssToMerge [][]rawRow
+
+	rrss.rowssToFlushLock.Lock()
+	if len(rrss.rowssToFlush) == 0 {
+		rrss.updateFlushDeadline()
+	}
+	rrss.rowssToFlush = append(rrss.rowssToFlush, rowsToFlush)
+	if len(rrss.rowssToFlush) >= defaultPartsToMerge {
+		rowssToMerge = rrss.rowssToFlush
+		rrss.rowssToFlush = nil
+	}
+	rrss.rowssToFlushLock.Unlock()
+
+	pt.flushRowssToInmemoryParts(rowssToMerge)
+}
+
+func (rrss *rawRowsShards) Len() int {
+	n := 0
+	for i := range rrss.shards[:] {
+		n += rrss.shards[i].Len()
+	}
+
+	rrss.rowssToFlushLock.Lock()
+	for _, rows := range rrss.rowssToFlush {
+		n += len(rows)
+	}
+	rrss.rowssToFlushLock.Unlock()
+
+	return n
+}
+
+func (rrss *rawRowsShards) updateFlushDeadline() {
+	rrss.flushDeadlineMs.Store(time.Now().Add(pendingRowsFlushInterval).UnixMilli())
+}
+
+type rawRowsShardNopad struct {
+	flushDeadlineMs atomic.Int64
+
+	mu   sync.Mutex
+	rows []rawRow
+}
+
+type rawRowsShard struct {
+	rawRowsShardNopad
+
+	// The padding prevents false sharing on widespread platforms with
+	// 128 mod (cache line size) = 0 .
+	_ [128 - unsafe.Sizeof(rawRowsShardNopad{})%128]byte
+}
+
+func (rrs *rawRowsShard) Len() int {
+	rrs.mu.Lock()
+	n := len(rrs.rows)
+	rrs.mu.Unlock()
+	return n
+}
+
+func (rrs *rawRowsShard) addRows(rows []rawRow) ([]rawRow, []rawRow) {
+	var rowsToFlush []rawRow
+
+	rrs.mu.Lock()
+	if cap(rrs.rows) == 0 {
+		rrs.rows = newRawRows()
+	}
+	if len(rrs.rows) == 0 {
+		rrs.updateFlushDeadline()
+	}
+	n := copy(rrs.rows[len(rrs.rows):cap(rrs.rows)], rows)
+	rrs.rows = rrs.rows[:len(rrs.rows)+n]
+	rows = rows[n:]
+	if len(rows) > 0 {
+		rowsToFlush = rrs.rows
+		rrs.rows = newRawRows()
+		rrs.updateFlushDeadline()
+		n = copy(rrs.rows[:cap(rrs.rows)], rows)
+		rrs.rows = rrs.rows[:n]
+		rows = rows[n:]
+	}
+	rrs.mu.Unlock()
+
+	return rows, rowsToFlush
+}
+
+func newRawRows() []rawRow {
+	return make([]rawRow, 0, maxRawRowsPerShard)
+}
+
+func (pt *partition) flushRowssToInmemoryParts(rowss [][]rawRow) {
+	if len(rowss) == 0 {
 		return
 	}
 
 	// Convert rowss into in-memory parts.
-	pws := make([]*partWrapper, len(nonEmptyRowss))
+	var pwsLock sync.Mutex
+	pws := make([]*partWrapper, 0, len(rowss))
 	wg := getWaitGroup()
-	for i, rows := range nonEmptyRowss {
+	for _, rows := range rowss {
+		wg.Add(1)
 		inmemoryPartsConcurrencyCh <- struct{}{}
-		wg.Go(func() {
-			pws[i] = pt.mustCreateInmemoryPart(rows)
-			<-inmemoryPartsConcurrencyCh
-		})
+		go func(rowsChunk []rawRow) {
+			defer func() {
+				<-inmemoryPartsConcurrencyCh
+				wg.Done()
+			}()
+
+			pw := pt.createInmemoryPart(rowsChunk)
+			if pw != nil {
+				pwsLock.Lock()
+				pws = append(pws, pw)
+				pwsLock.Unlock()
+			}
+		}(rows)
 	}
 	wg.Wait()
 	putWaitGroup(wg)
@@ -529,7 +613,6 @@ func (pt *partition) NotifyReadWriteMode() {
 	pt.startInmemoryPartsMergers()
 	pt.startSmallPartsMergers()
 	pt.startBigPartsMergers()
-	pt.idb.tb.NotifyReadWriteMode()
 }
 
 func (pt *partition) inmemoryPartsMerger() {
@@ -651,14 +734,15 @@ func (pt *partition) mustMergeInmemoryParts(pws []*partWrapper) []*partWrapper {
 	wg := getWaitGroup()
 	for len(pws) > 0 {
 		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
+		wg.Add(1)
 		inmemoryPartsConcurrencyCh <- struct{}{}
-
-		wg.Go(func() {
+		go func(pwsChunk []*partWrapper) {
 			defer func() {
 				<-inmemoryPartsConcurrencyCh
+				wg.Done()
 			}()
 
-			pw := pt.mustMergeInmemoryPartsFinal(pwsToMerge)
+			pw := pt.mustMergeInmemoryPartsFinal(pwsChunk)
 			if pw == nil {
 				return
 			}
@@ -666,7 +750,7 @@ func (pt *partition) mustMergeInmemoryParts(pws []*partWrapper) []*partWrapper {
 			pwsResultLock.Lock()
 			pwsResult = append(pwsResult, pw)
 			pwsResultLock.Unlock()
-		})
+		}(pwsToMerge)
 		pws = pwsRemaining
 	}
 	wg.Wait()
@@ -675,17 +759,6 @@ func (pt *partition) mustMergeInmemoryParts(pws []*partWrapper) []*partWrapper {
 	return pwsResult
 }
 
-// mustMergeInmemoryPartsFinal merges the given in-memory part wrappers (pws)
-// into a single new in-memory part wrapper.
-//
-// It panics if the input slice pws is empty (though the caller should prevent
-// this). If the pws contains only one element, it is returned as is. Finally,
-// when len(pws) > 1, the source pws are merged, and their ref count is
-// decremented.
-//
-// Returns nil if the merge results in an empty part (e.g., due to retention
-// filters removing all data). Otherwise, returns the wrapper for the merged
-// part.
 func (pt *partition) mustMergeInmemoryPartsFinal(pws []*partWrapper) *partWrapper {
 	if len(pws) == 0 {
 		logger.Panicf("BUG: pws must contain at least a single item")
@@ -732,28 +805,19 @@ func (pt *partition) mustMergeInmemoryPartsFinal(pws []*partWrapper) *partWrappe
 	if err != nil {
 		logger.Panicf("FATAL: cannot merge inmemoryBlocks: %s", err)
 	}
-	for _, pw := range pws {
-		pw.decRef()
-	}
+	mpDst.ph = *ph
 
-	// The resulting part is empty, no need to create a part wrapper
+	// resulting part is empty, no need to create a part wrapper
 	if ph.BlocksCount == 0 {
-		putInmemoryPart(mpDst)
 		return nil
 	}
 
-	mpDst.ph = *ph
 	return newPartWrapperFromInmemoryPart(mpDst, flushToDiskDeadline)
 }
 
-// mustCreateInmemoryPart creates a new in-memory part from rawRows.
-//
-// The number of rawRows cannot be zero. Otherwise the method will panic.
-//
-// The returned value is always a non-nil partWrapper.
-func (pt *partition) mustCreateInmemoryPart(rows []rawRow) *partWrapper {
+func (pt *partition) createInmemoryPart(rows []rawRow) *partWrapper {
 	if len(rows) == 0 {
-		logger.Panicf("BUG: a part cannot be created from 0 rawRows")
+		return nil
 	}
 	mp := getInmemoryPart()
 	mp.InitFromRows(rows)
@@ -788,7 +852,7 @@ func newPartWrapperFromInmemoryPart(mp *inmemoryPart, flushToDiskDeadline time.T
 
 // HasTimestamp returns true if the pt contains the given timestamp.
 func (pt *partition) HasTimestamp(timestamp int64) bool {
-	return pt.tr.contains(timestamp)
+	return timestamp >= pt.tr.MinTimestamp && timestamp <= pt.tr.MaxTimestamp
 }
 
 // GetParts appends parts snapshot to dst and returns it.
@@ -862,37 +926,15 @@ func (pt *partition) MustClose() {
 
 	for _, pw := range smallParts {
 		pw.decRef()
-		if refCount := pw.refCount.Load(); refCount != 0 {
-			logger.Panicf("BUG: unexpected non-zero refCount: %d", refCount)
-		}
 	}
 	for _, pw := range bigParts {
 		pw.decRef()
-		if refCount := pw.refCount.Load(); refCount != 0 {
-			logger.Panicf("BUG: unexpected non-zero refCount: %d", refCount)
-		}
 	}
-
-	idb := pt.idb
-	pt.idb = nil
-	idb.MustClose()
-}
-
-// DebugFlush flushes pending raw index and data rows of this partition so they
-// become visible to search.
-//
-// This function is for debug purposes only.
-func (pt *partition) DebugFlush() {
-	pt.idb.tb.DebugFlush()
-	pt.flushPendingRows(true)
-
-	// Wait for background flushers to finish.
-	pt.flushPendingItemsWG.Wait()
 }
 
 func (pt *partition) startInmemoryPartsMergers() {
 	pt.partsLock.Lock()
-	for range cap(inmemoryPartsConcurrencyCh) {
+	for i := 0; i < cap(inmemoryPartsConcurrencyCh); i++ {
 		pt.startInmemoryPartsMergerLocked()
 	}
 	pt.partsLock.Unlock()
@@ -904,12 +946,16 @@ func (pt *partition) startInmemoryPartsMergerLocked() {
 		return
 	default:
 	}
-	pt.wg.Go(pt.inmemoryPartsMerger)
+	pt.wg.Add(1)
+	go func() {
+		pt.inmemoryPartsMerger()
+		pt.wg.Done()
+	}()
 }
 
 func (pt *partition) startSmallPartsMergers() {
 	pt.partsLock.Lock()
-	for range cap(smallPartsConcurrencyCh) {
+	for i := 0; i < cap(smallPartsConcurrencyCh); i++ {
 		pt.startSmallPartsMergerLocked()
 	}
 	pt.partsLock.Unlock()
@@ -921,12 +967,16 @@ func (pt *partition) startSmallPartsMergerLocked() {
 		return
 	default:
 	}
-	pt.wg.Go(pt.smallPartsMerger)
+	pt.wg.Add(1)
+	go func() {
+		pt.smallPartsMerger()
+		pt.wg.Done()
+	}()
 }
 
 func (pt *partition) startBigPartsMergers() {
 	pt.partsLock.Lock()
-	for range cap(bigPartsConcurrencyCh) {
+	for i := 0; i < cap(bigPartsConcurrencyCh); i++ {
 		pt.startBigPartsMergerLocked()
 	}
 	pt.partsLock.Unlock()
@@ -938,19 +988,35 @@ func (pt *partition) startBigPartsMergerLocked() {
 		return
 	default:
 	}
-	pt.wg.Go(pt.bigPartsMerger)
+	pt.wg.Add(1)
+	go func() {
+		pt.bigPartsMerger()
+		pt.wg.Done()
+	}()
 }
 
 func (pt *partition) startPendingRowsFlusher() {
-	pt.wg.Go(pt.pendingRowsFlusher)
+	pt.wg.Add(1)
+	go func() {
+		pt.pendingRowsFlusher()
+		pt.wg.Done()
+	}()
 }
 
 func (pt *partition) startInmemoryPartsFlusher() {
-	pt.wg.Go(pt.inmemoryPartsFlusher)
+	pt.wg.Add(1)
+	go func() {
+		pt.inmemoryPartsFlusher()
+		pt.wg.Done()
+	}()
 }
 
 func (pt *partition) startStalePartsRemover() {
-	pt.wg.Go(pt.stalePartsRemover)
+	pt.wg.Add(1)
+	go func() {
+		pt.stalePartsRemover()
+		pt.wg.Done()
+	}()
 }
 
 var (
@@ -1018,9 +1084,7 @@ func (pt *partition) pendingRowsFlusher() {
 }
 
 func (pt *partition) flushPendingRows(isFinal bool) {
-	pt.flushPendingItemsWG.Add(1)
-	pt.rawRows.flush(pt.flushRowssToInmemoryParts, isFinal)
-	pt.flushPendingItemsWG.Done()
+	pt.rawRows.flush(pt, isFinal)
 }
 
 func (pt *partition) flushInmemoryRowsToFiles() {
@@ -1046,6 +1110,66 @@ func (pt *partition) flushInmemoryPartsToFiles(isFinal bool) {
 	}
 }
 
+func (rrss *rawRowsShards) flush(pt *partition, isFinal bool) {
+	var dst [][]rawRow
+
+	currentTimeMs := time.Now().UnixMilli()
+	flushDeadlineMs := rrss.flushDeadlineMs.Load()
+	if isFinal || currentTimeMs >= flushDeadlineMs {
+		rrss.rowssToFlushLock.Lock()
+		dst = rrss.rowssToFlush
+		rrss.rowssToFlush = nil
+		rrss.rowssToFlushLock.Unlock()
+	}
+
+	for i := range rrss.shards {
+		dst = rrss.shards[i].appendRawRowsToFlush(dst, currentTimeMs, isFinal)
+	}
+
+	pt.flushRowssToInmemoryParts(dst)
+}
+
+func (rrs *rawRowsShard) appendRawRowsToFlush(dst [][]rawRow, currentTimeMs int64, isFinal bool) [][]rawRow {
+	flushDeadlineMs := rrs.flushDeadlineMs.Load()
+	if !isFinal && currentTimeMs < flushDeadlineMs {
+		// Fast path - nothing to flush
+		return dst
+	}
+
+	// Slow path - move rrs.rows to dst.
+	rrs.mu.Lock()
+	dst = appendRawRowss(dst, rrs.rows)
+	rrs.rows = rrs.rows[:0]
+	rrs.mu.Unlock()
+
+	return dst
+}
+
+func (rrs *rawRowsShard) updateFlushDeadline() {
+	rrs.flushDeadlineMs.Store(time.Now().Add(pendingRowsFlushInterval).UnixMilli())
+}
+
+func appendRawRowss(dst [][]rawRow, src []rawRow) [][]rawRow {
+	if len(src) == 0 {
+		return dst
+	}
+	if len(dst) == 0 {
+		dst = append(dst, newRawRows())
+	}
+	prows := &dst[len(dst)-1]
+	n := copy((*prows)[len(*prows):cap(*prows)], src)
+	*prows = (*prows)[:len(*prows)+n]
+	src = src[n:]
+	for len(src) > 0 {
+		rows := newRawRows()
+		n := copy(rows[:cap(rows)], src)
+		rows = rows[:len(rows)+n]
+		src = src[n:]
+		dst = append(dst, rows)
+	}
+	return dst
+}
+
 func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{}, concurrencyCh chan struct{}, useSparseCache bool) error {
 	pwsLen := len(pws)
 
@@ -1054,19 +1178,22 @@ func (pt *partition) mergePartsToFiles(pws []*partWrapper, stopCh <-chan struct{
 	wg := getWaitGroup()
 	for len(pws) > 0 {
 		pwsToMerge, pwsRemaining := getPartsForOptimalMerge(pws)
+		wg.Add(1)
 		concurrencyCh <- struct{}{}
+		go func(pwsChunk []*partWrapper) {
+			defer func() {
+				<-concurrencyCh
+				wg.Done()
+			}()
 
-		wg.Go(func() {
-			if err := pt.mergeParts(pwsToMerge, stopCh, true, useSparseCache); err != nil && !errors.Is(err, errForciblyStopped) {
+			if err := pt.mergeParts(pwsChunk, stopCh, true, useSparseCache); err != nil && !errors.Is(err, errForciblyStopped) {
 				errGlobalLock.Lock()
 				if errGlobal == nil {
 					errGlobal = err
 				}
 				errGlobalLock.Unlock()
 			}
-
-			<-concurrencyCh
-		})
+		}(pwsToMerge)
 		pws = pwsRemaining
 	}
 	wg.Wait()
@@ -1142,7 +1269,10 @@ func hasActiveMerges(pws []*partWrapper) bool {
 
 func getMaxInmemoryPartSize() uint64 {
 	// Allocate 10% of allowed memory for in-memory parts.
-	n := max(uint64(0.1*float64(memory.Allowed())/maxInmemoryParts), 1e6)
+	n := uint64(0.1 * float64(memory.Allowed()) / maxInmemoryParts)
+	if n < 1e6 {
+		n = 1e6
+	}
 	return n
 }
 
@@ -1150,7 +1280,10 @@ func (pt *partition) getMaxSmallPartSize() uint64 {
 	// Small parts are cached in the OS page cache,
 	// so limit their size by the remaining free RAM.
 	mem := memory.Remaining()
-	n := max(uint64(mem)/defaultPartsToMerge, 10e6)
+	n := uint64(mem) / defaultPartsToMerge
+	if n < 10e6 {
+		n = 10e6
+	}
 	// Make sure the output part fits available disk space for small parts.
 	sizeLimit := getMaxOutBytes(pt.smallPartsPath, cap(smallPartsConcurrencyCh))
 	if n > sizeLimit {
@@ -1172,7 +1305,10 @@ func getMaxOutBytes(path string, workersCount int) uint64 {
 	// since this will result in sub-optimal merges - e.g. many small parts will be left unmerged.
 
 	// Divide free space by the max number of concurrent merges.
-	maxOutBytes := min(n/uint64(workersCount), maxBigPartSize)
+	maxOutBytes := n / uint64(workersCount)
+	if maxOutBytes > maxBigPartSize {
+		maxOutBytes = maxBigPartSize
+	}
 	return maxOutBytes
 }
 
@@ -1193,6 +1329,16 @@ func (pt *partition) releasePartsToMerge(pws []*partWrapper) {
 		pw.isInMerge = false
 	}
 	pt.partsLock.Unlock()
+}
+
+func (pt *partition) runFinalDedup(stopCh <-chan struct{}) error {
+	t := time.Now()
+	logger.Infof("start removing duplicate samples from partition (%s, %s)", pt.bigPartsPath, pt.smallPartsPath)
+	if err := pt.ForceMergeAllParts(stopCh); err != nil {
+		return fmt.Errorf("cannot remove duplicate samples from partition (%s, %s): %w", pt.bigPartsPath, pt.smallPartsPath, err)
+	}
+	logger.Infof("duplicate samples have been removed from partition (%s, %s) in %.3f seconds", pt.bigPartsPath, pt.smallPartsPath, time.Since(t).Seconds())
+	return nil
 }
 
 func (pt *partition) isFinalDedupNeeded() bool {
@@ -1297,7 +1443,7 @@ func (pt *partition) mergeParts(pws []*partWrapper, stopCh <-chan struct{}, isFi
 		mpNew.ph = *ph
 	} else {
 		// Make sure the created part directory listing is synced.
-		fs.MustSyncPathAndParentDir(dstPartPath)
+		fs.MustSyncPath(dstPartPath)
 	}
 
 	// Atomically swap the source parts with the newly created part.
@@ -1423,9 +1569,7 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
 	}
 	retentionDeadline := currentTimestamp - pt.s.retentionMsecs
 	activeMerges.Add(1)
-	_ = useSparseCache // unused in OSS version.
-	dmis := pt.idb.getDeletedMetricIDs()
-	err := mergeBlockStreams(&ph, bsw, bsrs, stopCh, dmis, retentionDeadline, rowsMerged, rowsDeleted)
+	err := mergeBlockStreams(&ph, bsw, bsrs, stopCh, pt.s, retentionDeadline, rowsMerged, rowsDeleted, useSparseCache)
 	activeMerges.Add(-1)
 	mergesCount.Add(1)
 	if err != nil {
@@ -1443,7 +1587,7 @@ func (pt *partition) openCreatedPart(ph *partHeader, pws []*partWrapper, mpNew *
 	if ph.RowsCount == 0 {
 		// The created part is empty. Remove it
 		if mpNew == nil {
-			fs.MustRemoveDir(dstPartPath)
+			fs.MustRemoveAll(dstPartPath)
 		}
 		return nil
 	}
@@ -1479,37 +1623,35 @@ func (pt *partition) swapSrcWithDstParts(pws []*partWrapper, pwNew *partWrapper,
 	removedSmallParts := 0
 	removedBigParts := 0
 
-	func() {
-		// // Prevent from deadlock mentioned at https://github.com/VictoriaMetrics/VictoriaLogs/issues/1020#issuecomment-3763912067
-		pt.partsLock.Lock()
-		defer pt.partsLock.Unlock()
+	pt.partsLock.Lock()
 
-		pt.inmemoryParts, removedInmemoryParts = removeParts(pt.inmemoryParts, m)
-		pt.smallParts, removedSmallParts = removeParts(pt.smallParts, m)
-		pt.bigParts, removedBigParts = removeParts(pt.bigParts, m)
-		if pwNew != nil {
-			switch dstPartType {
-			case partInmemory:
-				pt.inmemoryParts = append(pt.inmemoryParts, pwNew)
-				pt.startInmemoryPartsMergerLocked()
-			case partSmall:
-				pt.smallParts = append(pt.smallParts, pwNew)
-				pt.startSmallPartsMergerLocked()
-			case partBig:
-				pt.bigParts = append(pt.bigParts, pwNew)
-				pt.startBigPartsMergerLocked()
-			default:
-				logger.Panicf("BUG: unknown partType=%d", dstPartType)
-			}
+	pt.inmemoryParts, removedInmemoryParts = removeParts(pt.inmemoryParts, m)
+	pt.smallParts, removedSmallParts = removeParts(pt.smallParts, m)
+	pt.bigParts, removedBigParts = removeParts(pt.bigParts, m)
+	if pwNew != nil {
+		switch dstPartType {
+		case partInmemory:
+			pt.inmemoryParts = append(pt.inmemoryParts, pwNew)
+			pt.startInmemoryPartsMergerLocked()
+		case partSmall:
+			pt.smallParts = append(pt.smallParts, pwNew)
+			pt.startSmallPartsMergerLocked()
+		case partBig:
+			pt.bigParts = append(pt.bigParts, pwNew)
+			pt.startBigPartsMergerLocked()
+		default:
+			logger.Panicf("BUG: unknown partType=%d", dstPartType)
 		}
+	}
 
-		// Atomically store the updated list of file-based parts on disk.
-		// This must be performed under partsLock in order to prevent from races
-		// when multiple concurrently running goroutines update the list.
-		if removedSmallParts > 0 || removedBigParts > 0 || (pwNew != nil && (dstPartType == partSmall || dstPartType == partBig)) {
-			mustWritePartNames(pt.smallParts, pt.bigParts, pt.smallPartsPath)
-		}
-	}()
+	// Atomically store the updated list of file-based parts on disk.
+	// This must be performed under partsLock in order to prevent from races
+	// when multiple concurrently running goroutines update the list.
+	if removedSmallParts > 0 || removedBigParts > 0 || pwNew != nil && (dstPartType == partSmall || dstPartType == partBig) {
+		mustWritePartNames(pt.smallParts, pt.bigParts, pt.smallPartsPath)
+	}
+
+	pt.partsLock.Unlock()
 
 	removedParts := removedInmemoryParts + removedSmallParts + removedBigParts
 	if removedParts != len(m) {
@@ -1687,14 +1829,20 @@ func appendPartsToMerge(dst, src []*partWrapper, maxPartsToMerge int, maxOutByte
 
 	sortPartsForOptimalMerge(src)
 
-	maxSrcParts := min(maxPartsToMerge, len(src))
-	minSrcParts := max((maxSrcParts+1)/2, 2)
+	maxSrcParts := maxPartsToMerge
+	if maxSrcParts > len(src) {
+		maxSrcParts = len(src)
+	}
+	minSrcParts := (maxSrcParts + 1) / 2
+	if minSrcParts < 2 {
+		minSrcParts = 2
+	}
 
 	// Exhaustive search for parts giving the lowest write amplification when merged.
 	var pws []*partWrapper
 	maxM := float64(0)
 	for i := minSrcParts; i <= maxSrcParts; i++ {
-		for j := range len(src) - i + 1 {
+		for j := 0; j <= len(src)-i; j++ {
 			a := src[j : j+i]
 			if a[0].p.size*uint64(len(a)) < a[len(a)-1].p.size {
 				// Do not merge parts with too big difference in size,
@@ -1760,10 +1908,14 @@ func getPartsSize(pws []*partWrapper) uint64 {
 }
 
 func mustOpenParts(partsFile, path string, partNames []string) []*partWrapper {
+	// The path can be missing after restoring from backup, so create it if needed.
+	fs.MustMkdirIfNotExist(path)
+	fs.MustRemoveTemporaryDirs(path)
+
 	// Remove txn and tmp directories, which may be left after the upgrade
 	// to v1.90.0 and newer versions.
-	fs.MustRemoveDir(filepath.Join(path, "txn"))
-	fs.MustRemoveDir(filepath.Join(path, "tmp"))
+	fs.MustRemoveAll(filepath.Join(path, "txn"))
+	fs.MustRemoveAll(filepath.Join(path, "tmp"))
 
 	// Remove dirs missing in partNames. These dirs may be left after unclean shutdown
 	// or after the update from versions prior to v1.90.0.
@@ -1777,8 +1929,8 @@ func mustOpenParts(partsFile, path string, partNames []string) []*partWrapper {
 		partPath := filepath.Join(path, partName)
 		if !fs.IsPathExist(partPath) {
 			logger.Panicf("FATAL: part %q is listed in %q, but is missing on disk; "+
-				"ensure %q contents is not corrupted; remove %q from %q in order to restore access to the remaining data",
-				partPath, partsFile, partsFile, partPath, partsFile)
+				"ensure %q contents is not corrupted; remove %q to rebuild its' content from the list of existing parts",
+				partPath, partsFile, partsFile, partsFile)
 		}
 
 		m[partName] = struct{}{}
@@ -1792,9 +1944,10 @@ func mustOpenParts(partsFile, path string, partNames []string) []*partWrapper {
 		if _, ok := m[fn]; !ok {
 			deletePath := filepath.Join(path, fn)
 			logger.Infof("deleting %q because it isn't listed in %q; this is the expected case after unclean shutdown", deletePath, partsFile)
-			fs.MustRemoveDir(deletePath)
+			fs.MustRemoveAll(deletePath)
 		}
 	}
+	fs.MustSyncPath(path)
 
 	// Open parts
 	var pws []*partWrapper
@@ -1814,8 +1967,8 @@ func mustOpenParts(partsFile, path string, partNames []string) []*partWrapper {
 // MustCreateSnapshotAt creates pt snapshot at the given smallPath and bigPath dirs.
 //
 // Snapshot is created using linux hard links, so it is usually created very quickly.
-func (pt *partition) MustCreateSnapshotAt(smallPath, bigPath, indexDBPath string) {
-	logger.Infof("creating partition snapshot of %q, %q, and %q...", pt.smallPartsPath, pt.bigPartsPath, pt.indexDBPartsPath)
+func (pt *partition) MustCreateSnapshotAt(smallPath, bigPath string) {
+	logger.Infof("creating partition snapshot of %q and %q...", pt.smallPartsPath, pt.bigPartsPath)
 	startTime := time.Now()
 
 	// Flush inmemory data to disk.
@@ -1842,13 +1995,8 @@ func (pt *partition) MustCreateSnapshotAt(smallPath, bigPath, indexDBPath string
 	pt.mustCreateSnapshot(pt.smallPartsPath, smallPath, pwsSmall)
 	pt.mustCreateSnapshot(pt.bigPartsPath, bigPath, pwsBig)
 
-	fs.MustSyncPathAndParentDir(smallPath)
-	fs.MustSyncPathAndParentDir(bigPath)
-
-	pt.idb.tb.MustCreateSnapshotAt(indexDBPath)
-
-	logger.Infof("created partition snapshot of %q, %q, and %q at %q, %q, and %q in %.3f seconds",
-		pt.smallPartsPath, pt.bigPartsPath, pt.indexDBPartsPath, smallPath, bigPath, indexDBPath, time.Since(startTime).Seconds())
+	logger.Infof("created partition snapshot of %q and %q at %q and %q in %.3f seconds",
+		pt.smallPartsPath, pt.bigPartsPath, smallPath, bigPath, time.Since(startTime).Seconds())
 }
 
 // mustCreateSnapshot creates a snapshot from srcDir to dstDir.
@@ -1861,14 +2009,18 @@ func (pt *partition) mustCreateSnapshot(srcDir, dstDir string, pws []*partWrappe
 	}
 
 	// Copy the appliedRetentionFilename to dstDir.
-	// This file can be created by VictoriaMetrics Enterprise.
-	// See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#retention-filters .
+	// This file can be created by VictoriaMetrics enterprise.
+	// See https://docs.victoriametrics.com/#retention-filters .
 	// Do not make hard link to this file, since it can be modified over time.
 	srcPath := filepath.Join(srcDir, appliedRetentionFilename)
 	if fs.IsPathExist(srcPath) {
 		dstPath := filepath.Join(dstDir, filepath.Base(srcPath))
 		fs.MustCopyFile(srcPath, dstPath)
 	}
+
+	fs.MustSyncPath(dstDir)
+	parentDir := filepath.Dir(dstDir)
+	fs.MustSyncPath(parentDir)
 }
 
 type partNamesJSON struct {
@@ -1946,5 +2098,5 @@ func mustReadPartNamesFromDir(srcDir string) []string {
 }
 
 func isSpecialDir(name string) bool {
-	return name == "tmp" || name == "txn" || name == snapshotsDirname
+	return name == "tmp" || name == "txn" || name == snapshotsDirname || fs.IsScheduledForRemoval(name)
 }

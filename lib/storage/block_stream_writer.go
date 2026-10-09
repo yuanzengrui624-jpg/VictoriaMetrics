@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/atomicutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
@@ -81,33 +81,33 @@ func (bsw *blockStreamWriter) MustInitFromInmemoryPart(mp *inmemoryPart, compres
 //
 // The bsw doesn't pollute OS page cache if nocache is set.
 func (bsw *blockStreamWriter) MustInitFromFilePart(path string, nocache bool, compressLevel int) {
-	bsw.reset()
-	bsw.compressLevel = compressLevel
-
 	path = filepath.Clean(path)
 
 	// Create the directory
 	fs.MustMkdirFailIfExist(path)
 
-	// Create part files in the directory in parallel in order to reduce the duration
-	// of the operation on high-latency storage systems such as NFS and Ceph.
-
-	var pfc filestream.ParallelFileCreator
-
+	// Create part files in the directory.
 	timestampsPath := filepath.Join(path, timestampsFilename)
-	valuesPath := filepath.Join(path, valuesFilename)
-	indexPath := filepath.Join(path, indexFilename)
-	metaindexPath := filepath.Join(path, metaindexFilename)
+	timestampsFile := filestream.MustCreate(timestampsPath, nocache)
 
-	pfc.Add(timestampsPath, &bsw.timestampsWriter, nocache)
-	pfc.Add(valuesPath, &bsw.valuesWriter, nocache)
-	pfc.Add(indexPath, &bsw.indexWriter, nocache)
+	valuesPath := filepath.Join(path, valuesFilename)
+	valuesFile := filestream.MustCreate(valuesPath, nocache)
+
+	indexPath := filepath.Join(path, indexFilename)
+	indexFile := filestream.MustCreate(indexPath, nocache)
 
 	// Always cache metaindex file in OS page cache, since it is immediately
 	// read after the merge.
-	pfc.Add(metaindexPath, &bsw.metaindexWriter, false)
+	metaindexPath := filepath.Join(path, metaindexFilename)
+	metaindexFile := filestream.MustCreate(metaindexPath, false)
 
-	pfc.Run()
+	bsw.reset()
+	bsw.compressLevel = compressLevel
+
+	bsw.timestampsWriter = timestampsFile
+	bsw.valuesWriter = valuesFile
+	bsw.indexWriter = indexFile
+	bsw.metaindexWriter = metaindexFile
 }
 
 // MustClose closes the bsw.
@@ -121,22 +121,18 @@ func (bsw *blockStreamWriter) MustClose() {
 	bsw.compressedMetaindexData = encoding.CompressZSTDLevel(bsw.compressedMetaindexData[:0], bsw.metaindexData, bsw.compressLevel)
 	fs.MustWriteData(bsw.metaindexWriter, bsw.compressedMetaindexData)
 
-	// Close writers in parallel in order to reduce the time needed for closing them
-	// on high-latency storage systems such as NFS or Ceph.
-	cs := []fs.MustCloser{
-		bsw.timestampsWriter,
-		bsw.valuesWriter,
-		bsw.indexWriter,
-		bsw.metaindexWriter,
-	}
-	fs.MustCloseParallel(cs)
+	// Close writers.
+	bsw.timestampsWriter.MustClose()
+	bsw.valuesWriter.MustClose()
+	bsw.indexWriter.MustClose()
+	bsw.metaindexWriter.MustClose()
 
 	bsw.reset()
 }
 
 // WriteExternalBlock writes b to bsw and updates ph and rowsMerged.
-func (bsw *blockStreamWriter) WriteExternalBlock(b *Block, ph *partHeader, rowsMerged *uint64) {
-	*rowsMerged += uint64(b.rowsCount())
+func (bsw *blockStreamWriter) WriteExternalBlock(b *Block, ph *partHeader, rowsMerged *atomic.Uint64) {
+	rowsMerged.Add(uint64(b.rowsCount()))
 	b.deduplicateSamplesDuringMerge()
 	headerData, timestampsData, valuesData := b.MarshalData(bsw.timestampsBlockOffset, bsw.valuesBlockOffset)
 
@@ -167,8 +163,8 @@ func (bsw *blockStreamWriter) WriteExternalBlock(b *Block, ph *partHeader, rowsM
 }
 
 var (
-	timestampsBlocksMerged atomicutil.Uint64
-	timestampsBytesSaved   atomicutil.Uint64
+	timestampsBlocksMerged atomic.Uint64
+	timestampsBytesSaved   atomic.Uint64
 )
 
 func updatePartHeader(b *Block, ph *partHeader) {
