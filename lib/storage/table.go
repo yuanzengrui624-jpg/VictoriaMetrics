@@ -491,8 +491,8 @@ func (tb *table) startHistoricalMergeWatcher() {
 }
 
 func (tb *table) historicalMergeWatcher() {
-	if !isDedupEnabled() {
-		// Deduplication and retentionFilters are disabled.
+	if !isDedupEnabled() && len(GetDownSamplingMeta()) == 0 {
+		// Deduplication is disabled.
 		return
 	}
 
@@ -501,46 +501,17 @@ func (tb *table) historicalMergeWatcher() {
 		defer tb.PutPartitions(ptws)
 		timestamp := timestampFromTime(time.Now())
 		currentPartitionName := timestampToPartitionName(timestamp)
-
-		var ptwsToMerge []*partitionWrapper
 		for _, ptw := range ptws {
 			if ptw.pt.name == currentPartitionName {
-				// Do not run force merge for the current month.
-				// For the current month, the samples are continuously
-				// deduplicated and retention filters applied by the background in-memory, small, and big part
-				// merge tasks. See:
-				// - partition.mergeParts() in partition.go and
-				// - Block.deduplicateSamplesDuringMerge() in block.go.
-				// - blockStreamMerger.getRetentionDeadline() in block_stream_merger.go
+				// Do run final dedup for the current month only big parts.
+				if err := ptw.pt.runFinalDedupOnlyBigParts(); err != nil {
+					logger.Errorf("cannot run final dedup only big parts for the current month only big partition %s: %s", ptw.pt.name, err)
+					continue
+				}
+			} else if err := ptw.pt.runFinalDedup(tb.stopCh); err != nil {
+				logger.Errorf("cannot run final dedup for partition %s: %s", ptw.pt.name, err)
 				continue
 			}
-			mergeScheduled := false
-			if ptw.pt.isFinalDedupNeeded() {
-				// mark partition with final deduplication marker
-				ptw.pt.isDedupScheduled.Store(true)
-				mergeScheduled = true
-			}
-			if mergeScheduled {
-				ptwsToMerge = append(ptwsToMerge, ptw)
-			}
-		}
-		for _, ptw := range ptwsToMerge {
-			t := time.Now()
-			pt := ptw.pt
-			var logContext []string
-			var logErrContext []string
-			if pt.isDedupScheduled.Load() {
-				logContext = append(logContext, "removing duplicate samples")
-				logErrContext = append(logErrContext, "remove duplicate samples")
-			}
-
-			logger.Infof("start %s for partition (%s, %s)", strings.Join(logContext, " and "), pt.bigPartsPath, pt.smallPartsPath)
-			if err := pt.ForceMergeAllParts(tb.stopCh); err != nil {
-				logger.Errorf("cannot %s for partition (%s, %s): %s", strings.Join(logErrContext, " and "), pt.bigPartsPath, pt.smallPartsPath, err)
-			}
-			logger.Infof("finished %s for partition (%s, %s) in %.3f seconds", strings.Join(logContext, " and "), pt.bigPartsPath, pt.smallPartsPath, time.Since(t).Seconds())
-
-			pt.isDedupScheduled.Store(false)
 		}
 	}
 
