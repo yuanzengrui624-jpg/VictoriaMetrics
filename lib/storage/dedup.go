@@ -26,79 +26,101 @@ func GetDedupInterval() int64 {
 
 var globalDedupInterval int64
 
-var downsamplingMeta []DownSamplingMeta
+var meta []DownSamplingMeta
 
-// GetDownSamplingMeta returns downsampling rules set via SetDownsampling.
-// The slice is ordered from the largest age to the smallest.
+// GetDownSamplingMeta returns the downsampling infos, which has been set via SetDownsampling.
 func GetDownSamplingMeta() []DownSamplingMeta {
-	return downsamplingMeta
+	return meta
 }
 
-// SetDownsampling parses rules like -downsampling.period=30d:1m,180d:5m.
-// Invalid rules are skipped. This must be called before initializing the storage.
+// SetDownsampling set downsampling infos, like  -downsampling.period=30d:5m,180d:1h
 func SetDownsampling(downsampling string) {
-	downsamplingMeta = nil
-	if downsampling == "" {
-		return
-	}
-	for _, rule := range strings.Split(downsampling, ",") {
-		chunks := strings.Split(rule, ":")
-		if len(chunks) != 2 {
-			continue
+	if downsampling != "" {
+		//downsampling like 30d:5m,180d:30m
+		aggregates := strings.Split(downsampling, ",")
+		if len(aggregates) > 0 {
+			for _, v := range aggregates {
+				chunks := strings.Split(v, ":")
+				if len(chunks) > 0 {
+					duration, e1 := convertDuration(chunks[0])
+					downsamplingInterval, e2 := convertDuration(chunks[1])
+					if e1 == nil && e2 == nil {
+						if downsamplingInterval > 1 {
+							dm := DownSamplingMeta{Duration: duration,
+								DownsamplingInterval: downsamplingInterval}
+							meta = append(meta, dm)
+						}
+					}
+				}
+			}
 		}
-		duration, err1 := convertDuration(chunks[0])
-		interval, err2 := convertDuration(chunks[1])
-		if err1 != nil || err2 != nil || interval <= time.Millisecond {
-			continue
+		if len(meta) > 1 {
+			sort.Slice(meta, func(i, j int) bool {
+				return meta[i].Duration > meta[j].Duration
+			})
 		}
-		downsamplingMeta = append(downsamplingMeta, DownSamplingMeta{
-			Duration:             duration,
-			DownsamplingInterval: interval,
-		})
-	}
-	if len(downsamplingMeta) > 1 {
-		sort.Slice(downsamplingMeta, func(i, j int) bool {
-			return downsamplingMeta[i].Duration > downsamplingMeta[j].Duration
-		})
 	}
 }
 
+// convertDuration parse downsampling like -downsampling.period=30d:5m,180d:1h
 func convertDuration(duration string) (time.Duration, error) {
-	var hours int
-	switch {
-	case strings.HasSuffix(duration, "y"):
-		value, err := strconv.Atoi(strings.TrimSuffix(duration, "y"))
+	/*
+		Golang's time library doesn't support many different
+		string formats (year, month, week, day) because they
+		aren't consistent ranges. But Java's library _does_.
+		Consequently, we'll need to handle all the custom
+		time ranges, and, to make the internal API call consistent,
+		we'll need to allow for durations that Go supports, too.
+		The nice thing is all the "broken" time ranges are > 1 hour,
+		so we can just make assumptions to convert them to a range in hours.
+		They aren't *good* assumptions, but they're reasonable
+		for this function.
+	*/
+	var actualDuration time.Duration
+	var err error
+	var timeValue int
+	if strings.HasSuffix(duration, "y") {
+		timeValue, err = strconv.Atoi(strings.Trim(duration, "y"))
 		if err != nil {
 			return 0, fmt.Errorf("invalid time range: %q", duration)
 		}
-		hours = value * 365 * 24
-		return time.ParseDuration(fmt.Sprintf("%dh", hours))
-	case strings.HasSuffix(duration, "w"):
-		value, err := strconv.Atoi(strings.TrimSuffix(duration, "w"))
+		timeValue = timeValue * 365 * 24
+		actualDuration, err = time.ParseDuration(fmt.Sprintf("%vh", timeValue))
 		if err != nil {
 			return 0, fmt.Errorf("invalid time range: %q", duration)
 		}
-		hours = value * 7 * 24
-		return time.ParseDuration(fmt.Sprintf("%dh", hours))
-	case strings.HasSuffix(duration, "d"):
-		value, err := strconv.Atoi(strings.TrimSuffix(duration, "d"))
+	} else if strings.HasSuffix(duration, "w") {
+		timeValue, err = strconv.Atoi(strings.Trim(duration, "w"))
 		if err != nil {
 			return 0, fmt.Errorf("invalid time range: %q", duration)
 		}
-		hours = value * 24
-		return time.ParseDuration(fmt.Sprintf("%dh", hours))
-	case strings.HasSuffix(duration, "h"), strings.HasSuffix(duration, "m"), strings.HasSuffix(duration, "s"), strings.HasSuffix(duration, "ms"):
-		parsed, err := time.ParseDuration(duration)
+		timeValue = timeValue * 7 * 24
+		actualDuration, err = time.ParseDuration(fmt.Sprintf("%vh", timeValue))
 		if err != nil {
 			return 0, fmt.Errorf("invalid time range: %q", duration)
 		}
-		return parsed, nil
-	default:
+	} else if strings.HasSuffix(duration, "d") {
+		timeValue, err = strconv.Atoi(strings.Trim(duration, "d"))
+		if err != nil {
+			return 0, fmt.Errorf("invalid time range: %q", duration)
+		}
+		timeValue = timeValue * 24
+		actualDuration, err = time.ParseDuration(fmt.Sprintf("%vh", timeValue))
+		if err != nil {
+			return 0, fmt.Errorf("invalid time range: %q", duration)
+		}
+	} else if strings.HasSuffix(duration, "h") || strings.HasSuffix(duration, "m") || strings.HasSuffix(duration, "s") || strings.HasSuffix(duration, "ms") {
+		actualDuration, err = time.ParseDuration(duration)
+		if err != nil {
+			return 0, fmt.Errorf("invalid time range: %q", duration)
+		}
+	} else {
 		return 0, fmt.Errorf("invalid time duration string: %q", duration)
 	}
+	return actualDuration, nil
 }
 
-// DownSamplingMeta is one age threshold and the dedup interval applied after that age.
+// DownSamplingMeta include Duration and DownsamplingInterval
 type DownSamplingMeta struct {
 	Duration             time.Duration
 	DownsamplingInterval time.Duration

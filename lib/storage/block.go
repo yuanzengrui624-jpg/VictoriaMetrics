@@ -166,12 +166,11 @@ func (b *Block) deduplicateSamplesDuringMerge() int64 {
 		return 0
 	}
 	dedupInterval := GetDedupInterval()
-	// Use the newest sample in this block. Rules are sorted from the oldest age to the newest,
-	// so the first matching rule is the coarsest interval that applies.
-	nowTime := time.Now().UnixMilli()
-	newest := srcTimestamps[len(srcTimestamps)-1]
+
+	nowTime := time.Now().UnixNano() / 1e6
+	i := srcTimestamps[len(srcTimestamps)-1]
 	for _, v := range samplingMeta {
-		if nowTime-newest > v.Duration.Milliseconds() {
+		if nowTime-i > v.Duration.Milliseconds() {
 			dedupInterval = v.DownsamplingInterval.Milliseconds()
 			break
 		}
@@ -180,12 +179,14 @@ func (b *Block) deduplicateSamplesDuringMerge() int64 {
 		// Deduplication is disabled.
 		return 0
 	}
+
 	srcValues := b.values[b.nextIdx:]
 	timestamps, values := deduplicateSamplesDuringMerge(srcTimestamps, srcValues, dedupInterval)
 	dedups := len(srcTimestamps) - len(timestamps)
 	dedupsDuringMerge.Add(uint64(dedups))
 	b.timestamps = b.timestamps[:b.nextIdx+len(timestamps)]
 	b.values = b.values[:b.nextIdx+len(values)]
+
 	return dedupInterval
 }
 
