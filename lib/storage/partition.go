@@ -1196,7 +1196,7 @@ func (pt *partition) releasePartsToMerge(pws []*partWrapper) {
 }
 
 func (pt *partition) isFinalDedupNeeded() bool {
-	dedupInterval := GetDedupInterval()
+	dedupInterval := dedupIntervalForTimestamp(pt.tr.MaxTimestamp, time.Now().UnixMilli())
 
 	pws := pt.GetParts(nil, false)
 	minDedupInterval := getMinDedupInterval(pws)
@@ -1432,7 +1432,7 @@ func (pt *partition) mergePartsInternal(dstPartPath string, bsw *blockStreamWrit
 		return nil, fmt.Errorf("cannot merge %d parts to %s: %w", len(bsrs), dstPartPath, err)
 	}
 	if dstPartPath != "" {
-		ph.MinDedupInterval = GetDedupInterval()
+		ph.MinDedupInterval = dedupIntervalForTimestamp(ph.MaxTimestamp, currentTimestamp)
 		ph.MustWriteMetadata(dstPartPath)
 	}
 	return &ph, nil

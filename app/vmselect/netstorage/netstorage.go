@@ -604,7 +604,7 @@ func mergeSortBlocks(dst *Result, sbh *sortBlocksHeap, dedupInterval int64) {
 			putSortBlock(top)
 		}
 	}
-	timestamps, values := storage.DeduplicateSamples(dst.Timestamps, dst.Values, dedupInterval)
+	timestamps, values := storage.DeduplicateSamplesWithDownsampling(dst.Timestamps, dst.Values, dedupInterval)
 	dedupSamples += len(dst.Timestamps) - len(timestamps)
 	dedupsDuringSelect.Add(dedupSamples)
 	dst.Timestamps = timestamps

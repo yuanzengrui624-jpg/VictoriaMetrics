@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/atomicutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
@@ -163,7 +164,7 @@ func (b *Block) deduplicateSamplesDuringMerge() {
 		// Nothing to dedup.
 		return
 	}
-	dedupInterval := GetDedupInterval()
+	dedupInterval := dedupIntervalForTimestamp(srcTimestamps[len(srcTimestamps)-1], time.Now().UnixMilli())
 	if dedupInterval <= 0 {
 		// Deduplication is disabled.
 		return
